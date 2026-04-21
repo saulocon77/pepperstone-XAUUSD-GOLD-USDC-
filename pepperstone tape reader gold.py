@@ -19,7 +19,6 @@ Variables de entorno (Railway / Linux):
   FUNDING_JUMP_THRESHOLD Salto mínimo |Δfunding| para aviso de cambio brusco (default 0.00002)
 
   WebSocket:
-  PING_INTERVAL_SEC      Intervalo ping JSON (default 50)
   WS_MAX_AGE_SEC         Reconexión forzada por edad de conexión (default 7200)
   RECONNECT_BASE_SEC     Backoff inicial tras error (default 1)
   RECONNECT_MAX_SEC      Backoff máximo (default 60)
@@ -87,7 +86,6 @@ def env_bool(key: str, default: bool = False) -> bool:
 
 
 WS_URL = os.environ.get("HL_WS_URL", DEFAULT_WS).strip()
-PING_INTERVAL_SEC = env_int("PING_INTERVAL_SEC", 50)
 WS_MAX_AGE_SEC = env_int("WS_MAX_AGE_SEC", 7200)
 RECONNECT_BASE_SEC = env_float("RECONNECT_BASE_SEC", 1.0)
 RECONNECT_MAX_SEC = env_float("RECONNECT_MAX_SEC", 60.0)
@@ -380,8 +378,9 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
             log.info("Conectando WebSocket %s …", WS_URL)
             async with websockets.connect(
                 WS_URL,
-                ping_interval=None,
-                close_timeout=10,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=30,
             ) as ws:
                 monitor.connected = True
                 monitor.last_error = None
@@ -389,8 +388,6 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                 for sub in subscribe_msgs(PERP_COIN):
                     await ws.send(json.dumps(sub))
                 log.info("Suscrito trades + activeAssetCtx para %s", PERP_COIN)
-
-                ping_task = asyncio.create_task(_ping_loop(ws, stop))
 
                 async def _close_after_ttl() -> None:
                     await asyncio.sleep(float(WS_MAX_AGE_SEC))
@@ -422,9 +419,6 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                     ttl_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await ttl_task
-                    ping_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await ping_task
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -438,17 +432,6 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
             backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
         finally:
             monitor.connected = False
-
-
-async def _ping_loop(ws: Any, stop: asyncio.Event) -> None:
-    try:
-        while not stop.is_set():
-            await asyncio.sleep(PING_INTERVAL_SEC)
-            await ws.send(json.dumps({"method": "ping"}))
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.debug("ping: %s", e)
 
 
 async def summary_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
