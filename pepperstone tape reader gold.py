@@ -19,7 +19,7 @@ Variables de entorno (Railway / Linux):
   FUNDING_JUMP_THRESHOLD Salto mínimo |Δfunding| para aviso de cambio brusco (default 0.00002)
 
   WebSocket:
-  PING_INTERVAL_SEC      Intervalo ping JSON (default 50)
+  PING_INTERVAL_SEC      (obsoleto — reemplazado por ping automático de la librería cada 20s)
   WS_MAX_AGE_SEC         Reconexión forzada por edad de conexión (default 7200)
   RECONNECT_BASE_SEC     Backoff inicial tras error (default 1)
   RECONNECT_MAX_SEC      Backoff máximo (default 60)
@@ -380,17 +380,21 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
             log.info("Conectando WebSocket %s …", WS_URL)
             async with websockets.connect(
                 WS_URL,
-                ping_interval=None,
-                close_timeout=10,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=30,
             ) as ws:
                 monitor.connected = True
                 monitor.last_error = None
                 backoff = RECONNECT_BASE_SEC
                 for sub in subscribe_msgs(PERP_COIN):
-                    await ws.send(json.dumps(sub))
-                log.info("Suscrito trades + activeAssetCtx para %s", PERP_COIN)
-
-                ping_task = asyncio.create_task(_ping_loop(ws, stop))
+                    if ws.open:
+                        await ws.send(json.dumps(sub))
+                    else:
+                        log.warning("Conexión cerrada antes de enviar suscripción; reconectando…")
+                        break
+                else:
+                    log.info("Suscrito trades + activeAssetCtx para %s", PERP_COIN)
 
                 async def _close_after_ttl() -> None:
                     await asyncio.sleep(float(WS_MAX_AGE_SEC))
@@ -422,14 +426,23 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                     ttl_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await ttl_task
-                    ping_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await ping_task
         except asyncio.CancelledError:
             break
+        except websockets.exceptions.ConnectionClosedError as e:
+            monitor.last_error = str(e)
+            log.warning("Conexión cerrada inesperadamente (ConnectionClosedError): %s — reintento en %.1fs", e, backoff)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
+                break
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
+        except websockets.exceptions.ConnectionClosedOK:
+            log.info("Conexión cerrada limpiamente (TTL o cierre remoto) — reconectando…")
+            backoff = RECONNECT_BASE_SEC
         except Exception as e:
             monitor.last_error = str(e)
-            log.warning("WebSocket error: %s — reintento en %.1fs", e, backoff)
+            log.warning("WebSocket error inesperado (%s): %s — reintento en %.1fs", type(e).__name__, e, backoff)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=backoff)
                 break
@@ -438,17 +451,6 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
             backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
         finally:
             monitor.connected = False
-
-
-async def _ping_loop(ws: Any, stop: asyncio.Event) -> None:
-    try:
-        while not stop.is_set():
-            await asyncio.sleep(PING_INTERVAL_SEC)
-            await ws.send(json.dumps({"method": "ping"}))
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log.debug("ping: %s", e)
 
 
 async def summary_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
