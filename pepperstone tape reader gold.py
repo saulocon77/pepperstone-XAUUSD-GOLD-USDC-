@@ -197,6 +197,23 @@ def fmt_ts_ms(t_ms: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
 
 
+async def send_telegram_alert(message: str) -> None:
+    """Send a message to Telegram via Bot API. Silently logs on failure."""
+    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        log.debug("Telegram no configurado (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID vacíos).")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    try:
+        async with httpx.AsyncClient(http2=False, timeout=10.0) as tg_client:
+            r = await tg_client.post(url, json=payload)
+            r.raise_for_status()
+    except Exception as exc:
+        log.warning("Telegram alert falló: %s", exc)
+
+
 def side_label(side: str) -> str:
     return "Buy" if side == "B" else "Sell" if side == "A" else side
 
@@ -244,7 +261,7 @@ class GoldTapeMonitor:
     connected: bool = False
     last_error: str | None = None
 
-    def process_trade(self, tr: dict[str, Any]) -> None:
+    async def process_trade(self, tr: dict[str, Any]) -> None:
         if tr.get("coin") != PERP_COIN:
             return
         try:
@@ -319,10 +336,29 @@ class GoldTapeMonitor:
             print(f"{ANSI.ALERT}⚠ {msg}{ANSI.RESET}", flush=True)
             log.warning(msg)
 
+        # --- Telegram alert for every INSTITUCIONAL trade ---
+        tg_msg = (
+            f"🚨 <b>INSTITUCIONAL {PERP_COIN}</b>\n"
+            f"Side: <b>{side_label(side)}</b>\n"
+            f"Size: {sz:.6f}\n"
+            f"Price: {tr.get('px')}\n"
+            f"CVD_inst: {self.cvd_institucional:+.6f}\n"
+            f"Time: {ts}"
+        )
+
+        # --- Trade direction suggestions ---
         if self.cvd_institucional > 0 and side == "B":
             sug = "Sugerencia LONG (hipótesis: CVD inst > 0 y agresión compradora)"
             print(f"{ANSI.GOLD}💡 {sug}{ANSI.RESET}", flush=True)
             log.info(sug)
+            tg_msg += f"\n\n💡 <b>{sug}</b>"
+        elif self.cvd_institucional < 0 and side == "A":
+            sug = "Sugerencia SHORT (hipótesis: CVD inst < 0 y agresión vendedora)"
+            print(f"{ANSI.GOLD}💡 {sug}{ANSI.RESET}", flush=True)
+            log.info(sug)
+            tg_msg += f"\n\n💡 <b>{sug}</b>"
+
+        await send_telegram_alert(tg_msg)
 
     def process_funding_ctx(self, data: dict[str, Any]) -> None:
         if data.get("coin") != PERP_COIN:
@@ -488,7 +524,7 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                             data = msg.get("data")
                             if isinstance(data, list):
                                 for tr in data:
-                                    monitor.process_trade(tr)
+                                    await monitor.process_trade(tr)
                         elif ch in ("activeAssetCtx", "activeSpotAssetCtx"):
                             monitor.process_funding_ctx(msg.get("data") or {})
                 finally:
