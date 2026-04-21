@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Pepperstone tape reader gold — monitor en vivo (Hyperliquid API, perp GOLD-USDC):
+Pepperstone tape reader gold — monitor en vivo (Hyperliquid API, perpetuo GOLD):
 tape, Z-score dinámico, CVD institucional, funding, leaderboard.
 
-Archivo: pepperstone tape reader gold.py · Mercado fijo: perpetuo GOLD-USDC.
+Archivo: pepperstone tape reader gold.py · Mercado fijo: perpetuo GOLD.
 
 Variables de entorno (Railway / Linux):
   HL_WS_URL              WebSocket (default wss://api.hyperliquid.xyz/ws)
@@ -60,7 +60,7 @@ import websockets
 
 DEFAULT_WS = "wss://api.hyperliquid.xyz/ws"
 DEFAULT_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
-PERP_COIN = "GOLD-USDC"
+PERP_COIN = "GOLD"
 BUFFER_MAX = 2000
 CALIBRATION_MIN = 100
 
