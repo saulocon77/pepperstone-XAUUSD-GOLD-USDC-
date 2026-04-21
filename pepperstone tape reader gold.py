@@ -228,6 +228,64 @@ async def send_telegram_alert(message: str) -> None:
         log.warning("send_telegram_alert: fallo al enviar mensaje (%s)", e)
 
 
+async def fetch_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict[str, Any],
+    max_retries: int = 5,
+) -> httpx.Response | None:
+    """POST *url* with *payload*, retrying on HTTP 429 with exponential backoff.
+
+    Waits 2s, 4s, 8s, 16s, 32s between attempts (doubles each time, starting at 2s).
+    Returns the :class:`httpx.Response` on success, or ``None`` if every attempt fails.
+    Never raises — callers must handle a ``None`` return gracefully.
+    """
+    delay = 2.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = await client.post(url, json=payload, timeout=45.0)
+            if r.status_code == 429:
+                if attempt < max_retries:
+                    log.warning(
+                        "fetch_with_retry: HTTP 429 (rate-limited) en intento %d/%d — "
+                        "reintentando en %.0fs (payload type=%r)",
+                        attempt,
+                        max_retries,
+                        delay,
+                        payload.get("type"),
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2.0
+                    continue
+                else:
+                    log.warning(
+                        "fetch_with_retry: HTTP 429 en intento final %d/%d — "
+                        "agotados los reintentos (payload type=%r)",
+                        attempt,
+                        max_retries,
+                        payload.get("type"),
+                    )
+                    return None
+            r.raise_for_status()
+            return r
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "fetch_with_retry: error en intento %d/%d (%s) — %s",
+                attempt,
+                max_retries,
+                payload.get("type"),
+                exc,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(delay)
+                delay *= 2.0
+            else:
+                return None
+    return None
+
+
 async def fetch_top_wallets(client: httpx.AsyncClient, limit: int) -> list[dict[str, Any]]:
     r = await client.get(LEADERBOARD_URL, timeout=120.0)
     r.raise_for_status()
@@ -423,20 +481,36 @@ def _universe_names(meta: Any) -> set[str]:
     return out
 
 
-async def verify_perp_coin_registered(client: httpx.AsyncClient) -> None:
-    """Comprueba que PERP_COIN existe en meta (principal o en algún dex HIP-3)."""
-    r = await client.post(INFO_URL, json={"type": "meta"}, timeout=45.0)
-    r.raise_for_status()
+async def verify_perp_coin_registered(client: httpx.AsyncClient) -> bool:
+    """Comprueba que PERP_COIN existe en meta (principal o en algún dex HIP-3).
+
+    Returns ``True`` if the coin was confirmed, ``False`` if verification could
+    not be completed (e.g. all retries exhausted due to rate-limiting).  Raises
+    ``ValueError`` only when the API responds successfully but the coin is
+    genuinely absent from every known universe.
+    """
+    r = await fetch_with_retry(client, INFO_URL, {"type": "meta"})
+    if r is None:
+        log.warning(
+            "verify_perp_coin_registered: no se pudo obtener meta tras todos los reintentos "
+            "(rate-limit persistente). El bot continuará con los datos del WebSocket."
+        )
+        return False
     main = r.json()
     if not isinstance(main, dict):
         raise ValueError(f"Respuesta meta inesperada (no es objeto JSON): {type(main).__name__}")
     names = _universe_names(main)
     if PERP_COIN in names:
         log.info("Perpetuo %s encontrado en meta (libro principal).", PERP_COIN)
-        return
+        return True
 
-    r2 = await client.post(INFO_URL, json={"type": "perpDexs"}, timeout=45.0)
-    r2.raise_for_status()
+    r2 = await fetch_with_retry(client, INFO_URL, {"type": "perpDexs"})
+    if r2 is None:
+        log.warning(
+            "verify_perp_coin_registered: no se pudo obtener perpDexs tras todos los reintentos "
+            "(rate-limit persistente). El bot continuará con los datos del WebSocket."
+        )
+        return False
     dex_list = r2.json()
     if not isinstance(dex_list, list):
         raise ValueError("Respuesta perpDexs inesperada (no es lista).")
@@ -447,14 +521,20 @@ async def verify_perp_coin_registered(client: httpx.AsyncClient) -> None:
         dex_name = entry.get("name")
         if not dex_name:
             continue
-        rm = await client.post(INFO_URL, json={"type": "meta", "dex": dex_name}, timeout=45.0)
-        rm.raise_for_status()
+        rm = await fetch_with_retry(client, INFO_URL, {"type": "meta", "dex": dex_name})
+        if rm is None:
+            log.warning(
+                "verify_perp_coin_registered: no se pudo obtener meta dex=%r tras todos los "
+                "reintentos — omitiendo este dex.",
+                dex_name,
+            )
+            continue
         mj = rm.json()
         if not isinstance(mj, dict):
             continue
         if PERP_COIN in _universe_names(mj):
             log.info("Perpetuo %s encontrado en meta dex=%s.", PERP_COIN, dex_name)
-            return
+            return True
 
     raise ValueError(
         f"HL_PERP_COIN={PERP_COIN!r} no aparece en meta (principal ni dexes HIP-3 consultados). "
@@ -619,7 +699,12 @@ async def main_async() -> None:
 
     async with httpx.AsyncClient(http2=False, timeout=45.0) as boot_client:
         try:
-            await verify_perp_coin_registered(boot_client)
+            verified = await verify_perp_coin_registered(boot_client)
+            if not verified:
+                log.warning(
+                    "Verificación de metadatos omitida por rate-limit persistente. "
+                    "El bot continuará; la verificación se reintentará en el próximo ciclo."
+                )
         except httpx.HTTPError as e:
             log.error("No se pudo verificar meta en %s: %s", INFO_URL, e)
             sys.exit(1)
