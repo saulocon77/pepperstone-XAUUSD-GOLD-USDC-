@@ -59,7 +59,7 @@ import websockets
 
 DEFAULT_WS = "wss://api.hyperliquid.xyz/ws"
 DEFAULT_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
-PERP_COIN = "GOLDUSD"
+PERP_COIN = "GOLD"
 BUFFER_MAX = 2000
 CALIBRATION_MIN = 100
 
