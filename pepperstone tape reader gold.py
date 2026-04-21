@@ -211,6 +211,23 @@ def alltime_pnl(row: dict[str, Any]) -> float:
     return 0.0
 
 
+async def send_telegram_alert(message: str) -> None:
+    """Envía un mensaje al bot de Telegram configurado via TELEGRAM_TOKEN y TELEGRAM_CHAT_ID."""
+    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        log.debug("send_telegram_alert: TELEGRAM_TOKEN o TELEGRAM_CHAT_ID no configurados, omitiendo.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message}
+    try:
+        async with httpx.AsyncClient(http2=False, timeout=10.0) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+    except Exception as e:
+        log.warning("send_telegram_alert: fallo al enviar mensaje (%s)", e)
+
+
 async def fetch_top_wallets(client: httpx.AsyncClient, limit: int) -> list[dict[str, Any]]:
     r = await client.get(LEADERBOARD_URL, timeout=120.0)
     r.raise_for_status()
@@ -323,6 +340,13 @@ class GoldTapeMonitor:
             sug = "Sugerencia LONG (hipótesis: CVD inst > 0 y agresión compradora)"
             print(f"{ANSI.GOLD}💡 {sug}{ANSI.RESET}", flush=True)
             log.info(sug)
+            asyncio.ensure_future(send_telegram_alert(f"💡 {sug}"))
+
+        if self.cvd_institucional < 0 and side == "A":
+            sug = "Sugerencia SHORT (hipótesis: CVD inst < 0 y agresión vendedora)"
+            print(f"{ANSI.GOLD}💡 {sug}{ANSI.RESET}", flush=True)
+            log.info(sug)
+            asyncio.ensure_future(send_telegram_alert(f"💡 {sug}"))
 
     def process_funding_ctx(self, data: dict[str, Any]) -> None:
         if data.get("coin") != PERP_COIN:
