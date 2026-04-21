@@ -319,7 +319,7 @@ class GoldTapeMonitor:
     connected: bool = False
     last_error: str | None = None
 
-    def process_trade(self, tr: dict[str, Any]) -> None:
+    async def process_trade(self, tr: dict[str, Any]) -> None:
         if tr.get("coin") != PERP_COIN:
             return
         try:
@@ -398,13 +398,19 @@ class GoldTapeMonitor:
             sug = "Sugerencia LONG (hipótesis: CVD inst > 0 y agresión compradora)"
             print(f"{ANSI.GOLD}💡 {sug}{ANSI.RESET}", flush=True)
             log.info(sug)
-            asyncio.ensure_future(send_telegram_alert(f"💡 {sug}"))
+            try:
+                await send_telegram_alert(f"💡 {sug}")
+            except Exception as e:
+                log.warning("process_trade: error enviando alerta Telegram LONG: %s", e)
 
         if self.cvd_institucional < 0 and side == "A":
             sug = "Sugerencia SHORT (hipótesis: CVD inst < 0 y agresión vendedora)"
             print(f"{ANSI.GOLD}💡 {sug}{ANSI.RESET}", flush=True)
             log.info(sug)
-            asyncio.ensure_future(send_telegram_alert(f"💡 {sug}"))
+            try:
+                await send_telegram_alert(f"💡 {sug}")
+            except Exception as e:
+                log.warning("process_trade: error enviando alerta Telegram SHORT: %s", e)
 
     def process_funding_ctx(self, data: dict[str, Any]) -> None:
         if data.get("coin") != PERP_COIN:
@@ -592,7 +598,7 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                             data = msg.get("data")
                             if isinstance(data, list):
                                 for tr in data:
-                                    monitor.process_trade(tr)
+                                    await monitor.process_trade(tr)
                         elif ch in ("activeAssetCtx", "activeSpotAssetCtx"):
                             monitor.process_funding_ctx(msg.get("data") or {})
                 finally:
