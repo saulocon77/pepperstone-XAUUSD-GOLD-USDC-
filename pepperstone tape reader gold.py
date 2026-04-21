@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Hyperliquid — Monitor GOLD-USDC (perp): tape, Z-score dinámico, CVD institucional, funding, leaderboard.
+Pepperstone tape reader gold — monitor en vivo (Hyperliquid API, perp GOLD-USDC):
+tape, Z-score dinámico, CVD institucional, funding, leaderboard.
 
-Mercado fijo: perpetuo GOLD-USDC.
+Archivo: pepperstone tape reader gold.py · Mercado fijo: perpetuo GOLD-USDC.
 
 Variables de entorno (Railway / Linux):
   HL_WS_URL              WebSocket (default wss://api.hyperliquid.xyz/ws)
@@ -110,7 +111,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     stream=sys.stderr,
 )
-log = logging.getLogger("hype_monitor")
+log = logging.getLogger("pepperstone_tape_reader_gold")
 
 
 class ANSI:
@@ -220,7 +221,7 @@ async def fetch_top_wallets(client: httpx.AsyncClient, limit: int) -> list[dict[
 
 
 @dataclass
-class HypeMonitor:
+class GoldTapeMonitor:
     brain: ZScoreBrain = field(default_factory=ZScoreBrain)
     funding: FundingMonitor = field(default_factory=FundingMonitor)
     cvd_institucional: float = 0.0
@@ -372,7 +373,7 @@ def parse_ws_message(raw: str) -> dict[str, Any] | None:
         return None
 
 
-async def ws_reader_loop(monitor: HypeMonitor, stop: asyncio.Event) -> None:
+async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
     backoff = RECONNECT_BASE_SEC
     while not stop.is_set():
         try:
@@ -450,7 +451,7 @@ async def _ping_loop(ws: Any, stop: asyncio.Event) -> None:
         log.debug("ping: %s", e)
 
 
-async def summary_loop(monitor: HypeMonitor, stop: asyncio.Event) -> None:
+async def summary_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=1.0)
@@ -484,7 +485,7 @@ async def leaderboard_loop(stop: asyncio.Event) -> None:
 
 async def main_async() -> None:
     stop = asyncio.Event()
-    monitor = HypeMonitor()
+    monitor = GoldTapeMonitor()
 
     loop = asyncio.get_running_loop()
 
@@ -498,7 +499,7 @@ async def main_async() -> None:
         pass
 
     log.info(
-        "%s Smart Money Monitor | WS=%s | WS_MAX_AGE=%ss | resumen cada %ss | leaderboard cada %ss",
+        "Pepperstone tape reader gold | activo=%s | WS=%s | WS_MAX_AGE=%ss | resumen cada %ss | leaderboard cada %ss",
         PERP_COIN,
         WS_URL,
         WS_MAX_AGE_SEC,
