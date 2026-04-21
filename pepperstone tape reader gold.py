@@ -386,8 +386,14 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                 monitor.last_error = None
                 backoff = RECONNECT_BASE_SEC
                 for sub in subscribe_msgs(PERP_COIN):
-                    await ws.send(json.dumps(sub))
+                    sub_json = json.dumps(sub)
+                    log.info("Enviando suscripción: %s", sub_json)
+                    await ws.send(sub_json)
                 log.info("Suscrito trades + activeAssetCtx para %s", PERP_COIN)
+
+                log.debug("Esperando confirmación de suscripción …")
+                await asyncio.sleep(1.0)
+                log.debug("Pausa post-suscripción completada, iniciando lectura de mensajes")
 
                 async def _close_after_ttl() -> None:
                     await asyncio.sleep(float(WS_MAX_AGE_SEC))
@@ -402,11 +408,14 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                             break
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
+                        log.debug("WS mensaje recibido: %s", raw)
                         msg = parse_ws_message(raw)
                         if msg is None:
+                            log.debug("WS mensaje no-JSON o handshake: %r", raw)
                             continue
                         ch = msg.get("channel")
                         if ch in ("subscriptionResponse", "pong"):
+                            log.info("WS confirmación recibida: channel=%s data=%s", ch, msg.get("data"))
                             continue
                         if ch == "trades":
                             data = msg.get("data")
@@ -421,6 +430,30 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                         await ttl_task
         except asyncio.CancelledError:
             break
+        except websockets.exceptions.ConnectionClosedOK as e:
+            monitor.last_error = str(e)
+            log.info(
+                "WebSocket cerrado limpiamente: code=%s reason=%r — reintento en %.1fs",
+                e.code, e.reason, backoff,
+            )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
+                break
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
+        except websockets.exceptions.ConnectionClosedError as e:
+            monitor.last_error = str(e)
+            log.warning(
+                "WebSocket cerrado con error: code=%s reason=%r — reintento en %.1fs",
+                e.code, e.reason, backoff,
+            )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
+                break
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
         except Exception as e:
             monitor.last_error = str(e)
             log.warning("WebSocket error: %s — reintento en %.1fs", e, backoff)
