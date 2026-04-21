@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Pepperstone tape reader gold — monitor en vivo (Hyperliquid API, perpetuo GOLD):
+Pepperstone tape reader gold — monitor en vivo (Hyperliquid API, perpetuo oro HIP-3):
 tape, Z-score dinámico, CVD institucional, funding, leaderboard.
 
-Archivo: pepperstone tape reader gold.py · Mercado fijo: perpetuo GOLD.
+Archivo: pepperstone tape reader gold.py · Por defecto PERP=xyz:GOLD (nombre en API; ver HL_PERP_COIN).
 
 Variables de entorno (Railway / Linux):
   HL_WS_URL              WebSocket (default wss://api.hyperliquid.xyz/ws)
+  HL_INFO_URL            POST JSON meta (default https://api.hyperliquid.xyz/info)
+  HL_PERP_COIN           Símbolo perpetuo exacto en API (default xyz:GOLD; el oro HIP-3 no es solo GOLD)
+  WS_USER_AGENT          User-Agent del handshake WS; vacío o "-" = omitir (UA por defecto de websockets)
   LOG_LEVEL              DEBUG|INFO|WARNING|ERROR (default INFO)
   HL_LOG_GRANDE          1/true: loguear trades \"Grande\" en DEBUG (default 0)
 
@@ -19,6 +22,7 @@ Variables de entorno (Railway / Linux):
   FUNDING_JUMP_THRESHOLD Salto mínimo |Δfunding| para aviso de cambio brusco (default 0.00002)
 
   WebSocket:
+  PING_INTERVAL_SEC      Intervalo ping JSON (default 50)
   WS_MAX_AGE_SEC         Reconexión forzada por edad de conexión (default 7200)
   RECONNECT_BASE_SEC     Backoff inicial tras error (default 1)
   RECONNECT_MAX_SEC      Backoff máximo (default 60)
@@ -52,14 +56,17 @@ from typing import Any
 import httpx
 import numpy as np
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 DEFAULT_WS = "wss://api.hyperliquid.xyz/ws"
+DEFAULT_INFO_URL = "https://api.hyperliquid.xyz/info"
 DEFAULT_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
-PERP_COIN = "GOLD"
+# Oro comercializado en dex HIP-3 "xyz" — el nombre en meta/WS es "xyz:GOLD", no "GOLD".
+PERP_COIN = (os.environ.get("HL_PERP_COIN") or "xyz:GOLD").strip() or "xyz:GOLD"
 BUFFER_MAX = 2000
 CALIBRATION_MIN = 100
 
@@ -86,6 +93,14 @@ def env_bool(key: str, default: bool = False) -> bool:
 
 
 WS_URL = os.environ.get("HL_WS_URL", DEFAULT_WS).strip()
+INFO_URL = os.environ.get("HL_INFO_URL", DEFAULT_INFO_URL).strip() or DEFAULT_INFO_URL
+_raw_ws_ua = os.environ.get("WS_USER_AGENT")
+if _raw_ws_ua is None:
+    WS_USER_AGENT_HEADER: str | None = "Mozilla/5.0 (compatible; PepperstoneTapeReaderGold/1.0)"
+else:
+    u = _raw_ws_ua.strip()
+    WS_USER_AGENT_HEADER = None if u in ("", "-") else u
+PING_INTERVAL_SEC = env_int("PING_INTERVAL_SEC", 50)
 WS_MAX_AGE_SEC = env_int("WS_MAX_AGE_SEC", 7200)
 RECONNECT_BASE_SEC = env_float("RECONNECT_BASE_SEC", 1.0)
 RECONNECT_MAX_SEC = env_float("RECONNECT_MAX_SEC", 60.0)
@@ -371,29 +386,84 @@ def parse_ws_message(raw: str) -> dict[str, Any] | None:
         return None
 
 
+def _universe_names(meta: Any) -> set[str]:
+    u = meta.get("universe") if isinstance(meta, dict) else None
+    if not isinstance(u, list):
+        return set()
+    out: set[str] = set()
+    for x in u:
+        if isinstance(x, dict):
+            n = x.get("name")
+            if n:
+                out.add(str(n))
+    return out
+
+
+async def verify_perp_coin_registered(client: httpx.AsyncClient) -> None:
+    """Comprueba que PERP_COIN existe en meta (principal o en algún dex HIP-3)."""
+    r = await client.post(INFO_URL, json={"type": "meta"}, timeout=45.0)
+    r.raise_for_status()
+    main = r.json()
+    if not isinstance(main, dict):
+        raise ValueError(f"Respuesta meta inesperada (no es objeto JSON): {type(main).__name__}")
+    names = _universe_names(main)
+    if PERP_COIN in names:
+        log.info("Perpetuo %s encontrado en meta (libro principal).", PERP_COIN)
+        return
+
+    r2 = await client.post(INFO_URL, json={"type": "perpDexs"}, timeout=45.0)
+    r2.raise_for_status()
+    dex_list = r2.json()
+    if not isinstance(dex_list, list):
+        raise ValueError("Respuesta perpDexs inesperada (no es lista).")
+
+    for entry in dex_list:
+        if not isinstance(entry, dict):
+            continue
+        dex_name = entry.get("name")
+        if not dex_name:
+            continue
+        rm = await client.post(INFO_URL, json={"type": "meta", "dex": dex_name}, timeout=45.0)
+        rm.raise_for_status()
+        mj = rm.json()
+        if not isinstance(mj, dict):
+            continue
+        if PERP_COIN in _universe_names(mj):
+            log.info("Perpetuo %s encontrado en meta dex=%s.", PERP_COIN, dex_name)
+            return
+
+    raise ValueError(
+        f"HL_PERP_COIN={PERP_COIN!r} no aparece en meta (principal ni dexes HIP-3 consultados). "
+        "Para oro en Hyperliquid suele ser xyz:GOLD; exporta HL_PERP_COIN=xyz:GOLD si usabas GOLD."
+    )
+
+
+async def _sleep_backoff_or_stop(stop: asyncio.Event, backoff: float) -> bool:
+    """Espera backoff salvo que stop se active; True = salir del bucle WS."""
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=backoff)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
 async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
     backoff = RECONNECT_BASE_SEC
     while not stop.is_set():
         try:
             log.info("Conectando WebSocket %s …", WS_URL)
-            async with websockets.connect(
-                WS_URL,
-                ping_interval=20,
-                ping_timeout=10,
-                close_timeout=30,
-            ) as ws:
+            ws_kw: dict[str, Any] = {"ping_interval": None, "close_timeout": 10}
+            if WS_USER_AGENT_HEADER is not None:
+                ws_kw["user_agent_header"] = WS_USER_AGENT_HEADER
+            async with websockets.connect(WS_URL, **ws_kw) as ws:
                 monitor.connected = True
                 monitor.last_error = None
                 backoff = RECONNECT_BASE_SEC
                 for sub in subscribe_msgs(PERP_COIN):
-                    sub_json = json.dumps(sub)
-                    log.info("Enviando suscripción: %s", sub_json)
-                    await ws.send(sub_json)
+                    await ws.send(json.dumps(sub))
                 log.info("Suscrito trades + activeAssetCtx para %s", PERP_COIN)
 
-                log.debug("Esperando confirmación de suscripción …")
-                await asyncio.sleep(1.0)
-                log.debug("Pausa post-suscripción completada, iniciando lectura de mensajes")
+                ping_task = asyncio.create_task(_ping_loop(ws, stop))
 
                 async def _close_after_ttl() -> None:
                     await asyncio.sleep(float(WS_MAX_AGE_SEC))
@@ -408,14 +478,11 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                             break
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
-                        log.debug("WS mensaje recibido: %s", raw)
                         msg = parse_ws_message(raw)
                         if msg is None:
-                            log.debug("WS mensaje no-JSON o handshake: %r", raw)
                             continue
                         ch = msg.get("channel")
                         if ch in ("subscriptionResponse", "pong"):
-                            log.info("WS confirmación recibida: channel=%s data=%s", ch, msg.get("data"))
                             continue
                         if ch == "trades":
                             data = msg.get("data")
@@ -428,43 +495,46 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                     ttl_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await ttl_task
+                    ping_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await ping_task
         except asyncio.CancelledError:
             break
-        except websockets.exceptions.ConnectionClosedOK as e:
+        except ConnectionClosed as e:
             monitor.last_error = str(e)
-            log.info(
-                "WebSocket cerrado limpiamente: code=%s reason=%r — reintento en %.1fs",
-                e.code, e.reason, backoff,
-            )
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=backoff)
-                break
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
-        except websockets.exceptions.ConnectionClosedError as e:
-            monitor.last_error = str(e)
+            parts: list[str] = []
+            if e.rcvd is not None:
+                parts.append(f"recibido code={e.rcvd.code} reason={e.rcvd.reason!r}")
+            if e.sent is not None:
+                parts.append(f"enviado code={e.sent.code} reason={e.sent.reason!r}")
+            detail = "; ".join(parts) if parts else repr(e)
             log.warning(
-                "WebSocket cerrado con error: code=%s reason=%r — reintento en %.1fs",
-                e.code, e.reason, backoff,
+                "WebSocket cerrado (ConnectionClosed): %s — reintento en %.1fs",
+                detail,
+                backoff,
             )
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=backoff)
+            if await _sleep_backoff_or_stop(stop, backoff):
                 break
-            except asyncio.TimeoutError:
-                pass
             backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
         except Exception as e:
             monitor.last_error = str(e)
             log.warning("WebSocket error: %s — reintento en %.1fs", e, backoff)
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=backoff)
+            if await _sleep_backoff_or_stop(stop, backoff):
                 break
-            except asyncio.TimeoutError:
-                pass
             backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
         finally:
             monitor.connected = False
+
+
+async def _ping_loop(ws: Any, stop: asyncio.Event) -> None:
+    try:
+        while not stop.is_set():
+            await asyncio.sleep(PING_INTERVAL_SEC)
+            await ws.send(json.dumps({"method": "ping"}))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.debug("ping: %s", e)
 
 
 async def summary_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
@@ -522,6 +592,16 @@ async def main_async() -> None:
         SUMMARY_INTERVAL_SEC,
         LEADERBOARD_REFRESH_SEC,
     )
+
+    async with httpx.AsyncClient(http2=False, timeout=45.0) as boot_client:
+        try:
+            await verify_perp_coin_registered(boot_client)
+        except httpx.HTTPError as e:
+            log.error("No se pudo verificar meta en %s: %s", INFO_URL, e)
+            sys.exit(1)
+        except ValueError as e:
+            log.error("%s", e)
+            sys.exit(1)
 
     tasks = [
         asyncio.create_task(ws_reader_loop(monitor, stop), name="ws"),
