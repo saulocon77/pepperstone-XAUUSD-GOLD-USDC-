@@ -23,6 +23,7 @@ Variables de entorno (Railway / Linux):
 
   WebSocket:
   PING_INTERVAL_SEC      Intervalo ping JSON (default 50)
+  WS_RECV_TIMEOUT_SEC    Timeout sin datos antes de reconectar (default 45)
   WS_MAX_AGE_SEC         Reconexión forzada por edad de conexión (default 7200)
   RECONNECT_BASE_SEC     Backoff inicial tras error (default 1)
   RECONNECT_MAX_SEC      Backoff máximo (default 60)
@@ -101,6 +102,7 @@ else:
     u = _raw_ws_ua.strip()
     WS_USER_AGENT_HEADER = None if u in ("", "-") else u
 PING_INTERVAL_SEC = env_int("PING_INTERVAL_SEC", 50)
+WS_RECV_TIMEOUT_SEC = env_int("WS_RECV_TIMEOUT_SEC", 45)
 WS_MAX_AGE_SEC = env_int("WS_MAX_AGE_SEC", 7200)
 RECONNECT_BASE_SEC = env_float("RECONNECT_BASE_SEC", 1.0)
 RECONNECT_MAX_SEC = env_float("RECONNECT_MAX_SEC", 60.0)
@@ -559,9 +561,16 @@ async def _sleep_backoff_or_stop(stop: asyncio.Event, backoff: float) -> bool:
 
 async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
     backoff = RECONNECT_BASE_SEC
+    attempt = 0
     while not stop.is_set():
+        attempt += 1
         try:
-            log.info("Conectando WebSocket %s …", WS_URL)
+            log.info(
+                "Conectando WebSocket %s (intento #%d, backoff=%.1fs) …",
+                WS_URL,
+                attempt,
+                backoff if attempt > 1 else 0.0,
+            )
             ws_kw: dict[str, Any] = {"ping_interval": None, "close_timeout": 10}
             if WS_USER_AGENT_HEADER is not None:
                 ws_kw["user_agent_header"] = WS_USER_AGENT_HEADER
@@ -569,9 +578,17 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                 monitor.connected = True
                 monitor.last_error = None
                 backoff = RECONNECT_BASE_SEC
+                attempt = 0
                 for sub in subscribe_msgs(PERP_COIN):
                     await ws.send(json.dumps(sub))
-                log.info("Suscrito trades + activeAssetCtx para %s", PERP_COIN)
+                log.info(
+                    "WebSocket conectado y suscrito a trades + activeAssetCtx para %s "
+                    "(recv_timeout=%ss, ping_interval=%ss, max_age=%ss)",
+                    PERP_COIN,
+                    WS_RECV_TIMEOUT_SEC,
+                    PING_INTERVAL_SEC,
+                    WS_MAX_AGE_SEC,
+                )
 
                 ping_task = asyncio.create_task(_ping_loop(ws, stop))
 
@@ -583,8 +600,17 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                 ttl_task = asyncio.create_task(_close_after_ttl())
 
                 try:
-                    async for raw in ws:
-                        if stop.is_set():
+                    while not stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(
+                                ws.recv(), timeout=float(WS_RECV_TIMEOUT_SEC)
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                "WebSocket sin datos durante %ss — reconectando …",
+                                WS_RECV_TIMEOUT_SEC,
+                            )
+                            monitor.last_error = f"recv timeout after {WS_RECV_TIMEOUT_SEC}s"
                             break
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
@@ -593,6 +619,7 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
                             continue
                         ch = msg.get("channel")
                         if ch in ("subscriptionResponse", "pong"):
+                            log.debug("WebSocket ack: channel=%s", ch)
                             continue
                         if ch == "trades":
                             data = msg.get("data")
@@ -626,9 +653,22 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
             if await _sleep_backoff_or_stop(stop, backoff):
                 break
             backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
+        except OSError as e:
+            monitor.last_error = str(e)
+            log.warning(
+                "WebSocket error de red (OSError): %s — reintento en %.1fs", e, backoff
+            )
+            if await _sleep_backoff_or_stop(stop, backoff):
+                break
+            backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
         except Exception as e:
             monitor.last_error = str(e)
-            log.warning("WebSocket error: %s — reintento en %.1fs", e, backoff)
+            log.warning(
+                "WebSocket error inesperado (%s): %s — reintento en %.1fs",
+                type(e).__name__,
+                e,
+                backoff,
+            )
             if await _sleep_backoff_or_stop(stop, backoff):
                 break
             backoff = min(RECONNECT_MAX_SEC, backoff * 2.0)
@@ -637,14 +677,22 @@ async def ws_reader_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
 
 
 async def _ping_loop(ws: Any, stop: asyncio.Event) -> None:
+    """Envía un ping JSON periódico para mantener viva la conexión WebSocket."""
     try:
         while not stop.is_set():
             await asyncio.sleep(PING_INTERVAL_SEC)
-            await ws.send(json.dumps({"method": "ping"}))
+            if stop.is_set():
+                break
+            try:
+                await ws.send(json.dumps({"method": "ping"}))
+                log.debug("ping enviado al servidor WebSocket")
+            except Exception as ping_err:
+                log.warning("ping: fallo al enviar heartbeat — %s", ping_err)
+                break
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.debug("ping: %s", e)
+        log.debug("_ping_loop: salida inesperada — %s", e)
 
 
 async def summary_loop(monitor: GoldTapeMonitor, stop: asyncio.Event) -> None:
